@@ -1,0 +1,36 @@
+name: Collector — Parse Raw to Opportunities
+
+on:
+  # ssdm-scraper가 수집 끝내면 보내는 이벤트
+  repository_dispatch:
+    types: [scrap-finished]
+  
+  # 수동 실행
+  workflow_dispatch:
+  
+  # 백업 cron (이벤트 놓쳤을 때 대비)
+  schedule:
+    - cron: '30 20 * * *'    # KST 05:30 (scrap 30분 후)
+    - cron: '0 7 * * *'      # KST 16:00 (scrap 30분 후)
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install deps
+        run: pip install -r requirements.txt
+      
+      - name: Run collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python run.py
