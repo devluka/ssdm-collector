@@ -24,11 +24,30 @@ def upsert_opportunities(
     """
     Opportunity 리스트를 opportunities 테이블에 upsert.
     
+    같은 (source_key, ext_id) 조합이 한 batch 안에 두 번 이상 들어가면
+    PostgreSQL 21000 cardinality_violation 에러가 발생하므로, batch 만들기 전에
+    dedupe 처리한다. fetch_pending_raw가 fetched_at ASC 정렬로 가져오므로
+    dict 덮어쓰기 시 최신 fetched_at 행이 살아남는다.
+    
     Returns:
-        {"total": N, "upserted": M, "failed": K}
+        {"total": N, "upserted": M, "failed": K, "deduped": D}
     """
     if not opps:
-        return {"total": 0, "upserted": 0, "failed": 0}
+        return {"total": 0, "upserted": 0, "failed": 0, "deduped": 0}
+    
+    # (source_key, ext_id) 기준 dedupe
+    original_count = len(opps)
+    deduped_map = {}
+    for opp in opps:
+        row = opp.to_row()
+        key = (row.get("source_key"), row.get("ext_id"))
+        deduped_map[key] = opp
+    
+    opps = list(deduped_map.values())
+    deduped = original_count - len(opps)
+    if deduped > 0:
+        print(f"[Repository] deduped {deduped} duplicate rows "
+              f"({original_count} → {len(opps)})")
     
     upserted = 0
     failed = 0
@@ -51,9 +70,10 @@ def upsert_opportunities(
             print(f"[Repository] batch {i // batch_size + 1} failed: {e}")
     
     return {
-        "total": len(opps),
+        "total": original_count,
         "upserted": upserted,
         "failed": failed,
+        "deduped": deduped,
     }
 
 
