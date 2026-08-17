@@ -4,33 +4,58 @@ on:
   # ssdm-scraper가 수집 끝내면 보내는 이벤트
   repository_dispatch:
     types: [scrap-finished]
-  
-  # 수동 실행
+
+  # 수동 실행 (적체 해소 시 사이클 수 조절용)
   workflow_dispatch:
-  
+    inputs:
+      max_cycles:
+        description: '최대 사이클 수 (1사이클 = 1000건). 0이면 무제한'
+        required: false
+        default: '300'
+      batch_limit:
+        description: '사이클당 조회 건수'
+        required: false
+        default: '1000'
+      time_budget_sec:
+        description: '시간 예산(초). job timeout보다 짧게 유지'
+        required: false
+        default: '19800'
+
   # 백업 cron (이벤트 놓쳤을 때 대비)
   schedule:
     - cron: '30 20 * * *'    # KST 05:30 (scrap 30분 후)
     - cron: '0 7 * * *'      # KST 16:00 (scrap 30분 후)
 
+# 같은 워크플로우가 겹쳐 돌면 동일 raw 행을 두 프로세스가 잡는다.
+# 진행 중인 실행을 우선하고 새 실행은 대기시킨다.
+concurrency:
+  group: collector
+  cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # GitHub-hosted runner의 job 상한은 6시간(360분).
+    # TIME_BUDGET_SEC(기본 5시간 30분)이 먼저 걸려 정상 종료되도록 여유를 둔다.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      
+
       - name: Install deps
         run: pip install -r requirements.txt
-      
+
       - name: Run collector
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # workflow_dispatch 입력이 있으면 그 값, 없으면(cron/dispatch) 기본값
+          MAX_CYCLES: ${{ github.event.inputs.max_cycles || '300' }}
+          BATCH_LIMIT: ${{ github.event.inputs.batch_limit || '1000' }}
+          TIME_BUDGET_SEC: ${{ github.event.inputs.time_budget_sec || '19800' }}
         run: python run.py
