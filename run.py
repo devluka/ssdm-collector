@@ -6,10 +6,24 @@ ssdm-collector 진입점.
 실행 흐름:
 1. Supabase 클라이언트 생성
 2. SchemaCache 로드 (opportunities 컬럼 자동 파악)
-3. opportunities_raw에서 pending 1000건 SELECT
-4. source_key별로 그룹핑 → 각 parser로 정제
-5. opportunities 테이블에 upsert
-6. raw 처리 상태 마킹 (processed / error)
+3. 사이클 루프:
+   3-1. opportunities_raw에서 pending BATCH_LIMIT건 SELECT
+   3-2. source_key별로 그룹핑 → 각 parser로 정제
+   3-3. opportunities 테이블에 upsert
+   3-4. upsert 성공분만 processed, 실패분은 error 마킹
+   3-5. 종료 조건 검사 후 다음 사이클
+4. 전체 요약 출력
+
+종료 조건 (먼저 도달하는 것):
+- pending 없음 (완주)
+- MAX_CYCLES 도달
+- TIME_BUDGET_SEC 초과 (다음 사이클 시작 전 검사)
+- 직전 사이클과 동일한 raw_id 집합을 다시 잡음 (마킹 실패 → 무한루프 방지)
+
+환경변수:
+- BATCH_LIMIT      사이클당 조회 건수 (기본 1000)
+- MAX_CYCLES       최대 사이클 수 (기본 300, 0이면 무제한)
+- TIME_BUDGET_SEC  시간 예산 초 (기본 19800 = 5시간 30분)
 
 GitHub Actions에서 호출 (workflow_dispatch / repository_dispatch / cron).
 """
@@ -19,18 +33,37 @@ import os
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 from supabase import create_client
 
 from parsers import PARSER_REGISTRY
 from parsers._repository import (
     fetch_pending_raw,
-    mark_raw_error,
+    mark_raw_error_bulk,
     mark_raw_processed,
     upsert_opportunities,
 )
 from parsers._schema import SchemaCache
+
+
+# ---------------------------------------------------------------- config
+
+def _env_int(name: str, default: int) -> int:
+    """환경변수를 int로 읽되, 비었거나 파싱 실패면 default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[run] invalid {name}={raw!r}, using default {default}")
+        return default
+
+
+BATCH_LIMIT = _env_int("BATCH_LIMIT", 1000)
+MAX_CYCLES = _env_int("MAX_CYCLES", 300)
+TIME_BUDGET_SEC = _env_int("TIME_BUDGET_SEC", 19800)
 
 
 def _get_supabase():
@@ -44,97 +77,216 @@ def _get_supabase():
     return create_client(url, key)
 
 
+# ---------------------------------------------------------------- source 단위 처리
+
 def _process_source(sb, source_key: str, raw_rows: List[dict]) -> Dict[str, int]:
-    """단일 source의 raw 데이터들을 정제 + upsert."""
+    """
+    단일 source의 raw 데이터들을 정제 + upsert + 상태 마킹.
+
+    마킹 규칙:
+    - parse 실패        → error (사유별 bulk)
+    - upsert 성공       → processed
+    - upsert 실패       → error (재시도 대상이 아님. pending 유지 시 다음 사이클에
+                          같은 행을 다시 잡아 무한루프가 되므로 error로 격리)
+    """
     parser = PARSER_REGISTRY.get(source_key)
     if not parser:
-        print(f"[run] no parser for source_key={source_key}, skipping {len(raw_rows)} rows")
-        # parser 없으면 error 마킹
-        for row in raw_rows:
-            mark_raw_error(sb, row["id"], f"no parser registered for {source_key}")
-        return {"parsed": 0, "upserted": 0, "errors": len(raw_rows)}
-    
-    # 정제
-    opps = []
-    success_ids = []
-    error_count = 0
-    
+        ids = [r["id"] for r in raw_rows]
+        print(f"[run] no parser for source_key={source_key}, marking {len(ids)} as error")
+        mark_raw_error_bulk(sb, ids, f"no parser registered for {source_key}")
+        return {
+            "parsed": 0, "upserted": 0, "processed": 0,
+            "errors": len(ids), "settled": len(ids),
+        }
+
+    pairs: List[Tuple[int, object]] = []
+    none_ids: List[int] = []
+    exc_ids: Dict[str, List[int]] = defaultdict(list)
+
     for row in raw_rows:
         raw_id = row["id"]
         raw_data = row["raw_data"]
-        
+
         try:
             opp = parser.parse_one(raw_data)
             if opp is None:
-                mark_raw_error(sb, raw_id, "parser returned None")
-                error_count += 1
+                none_ids.append(raw_id)
                 continue
-            
-            opps.append(opp)
-            success_ids.append(raw_id)
+            pairs.append((raw_id, opp))
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
-            print(f"[run] parse error for {source_key} raw_id={raw_id}: {err_msg}")
-            mark_raw_error(sb, raw_id, err_msg)
-            error_count += 1
-    
-    # opportunities upsert
-    upsert_result = upsert_opportunities(sb, opps)
-    
-    # 성공 건들 processed 마킹
-    if success_ids:
-        marked = mark_raw_processed(sb, success_ids)
-        print(f"[run] {source_key}: marked {marked}/{len(success_ids)} as processed")
-    
+            exc_ids[err_msg].append(raw_id)
+
+    # parse 실패분 bulk 마킹
+    parse_error_count = 0
+    if none_ids:
+        parse_error_count += len(none_ids)
+        mark_raw_error_bulk(sb, none_ids, "parser returned None")
+    for err_msg, ids in exc_ids.items():
+        parse_error_count += len(ids)
+        print(f"[run] parse error x{len(ids)} ({source_key}): {err_msg}")
+        mark_raw_error_bulk(sb, ids, err_msg)
+
+    # upsert
+    upsert_result = upsert_opportunities(sb, pairs)
+
+    # upsert 성공분 processed
+    ok_ids = upsert_result["ok_raw_ids"]
+    processed = 0
+    if ok_ids:
+        processed = mark_raw_processed(sb, ok_ids)
+        print(f"[run] {source_key}: marked {processed}/{len(ok_ids)} as processed")
+
+    # upsert 실패분 error 격리
+    fail_ids = upsert_result["failed_raw_ids"]
+    if fail_ids:
+        mark_raw_error_bulk(sb, fail_ids, "upsert failed")
+        print(f"[run] {source_key}: marked {len(fail_ids)} as error (upsert failed)")
+
+    errors = parse_error_count + len(fail_ids)
+
     return {
-        "parsed": len(opps),
+        "parsed": len(pairs),
         "upserted": upsert_result["upserted"],
-        "errors": error_count + upsert_result["failed"],
+        "processed": processed,
+        "errors": errors,
+        # settled: 이번 사이클에서 pending을 벗어나야 하는 행 수
+        "settled": parse_error_count + len(ok_ids) + len(fail_ids),
     }
 
 
-def main():
-    started_at = time.time()
-    print(f"[run] ssdm-collector start")
-    
-    sb = _get_supabase()
-    
-    # 1. 스키마 캐시 로드
-    SchemaCache.load(sb)
-    
-    # 2. pending raw 조회
-    raw_rows = fetch_pending_raw(sb, limit=1000)
-    print(f"[run] fetched {len(raw_rows)} pending rows")
-    
-    if not raw_rows:
-        print("[run] nothing to do, exit")
-        return 0
-    
-    # 3. source_key별 그룹핑
+# ---------------------------------------------------------------- 사이클 1회
+
+def _run_cycle(sb, cycle_no: int) -> Dict[str, object]:
+    """
+    사이클 1회 실행.
+
+    Returns:
+        {
+            "fetched": N, "parsed": N, "upserted": N,
+            "processed": N, "errors": N, "settled": N,
+            "id_set": set[int],
+        }
+        fetched == 0 이면 더 처리할 pending 없음.
+    """
+    raw_rows = fetch_pending_raw(sb, limit=BATCH_LIMIT)
+    fetched = len(raw_rows)
+
+    if fetched == 0:
+        return {
+            "fetched": 0, "parsed": 0, "upserted": 0,
+            "processed": 0, "errors": 0, "settled": 0,
+            "id_set": set(),
+        }
+
+    id_set: Set[int] = {r["id"] for r in raw_rows}
+
     by_source: Dict[str, List[dict]] = defaultdict(list)
     for row in raw_rows:
         by_source[row["source_key"]].append(row)
-    
-    # 4. source별 처리
-    summary = {}
+
+    totals = {
+        "fetched": fetched, "parsed": 0, "upserted": 0,
+        "processed": 0, "errors": 0, "settled": 0,
+        "id_set": id_set,
+    }
+
     for source_key, rows in by_source.items():
-        print(f"\n[run] processing source={source_key} count={len(rows)}")
+        print(f"[run] cycle {cycle_no} | source={source_key} count={len(rows)}")
         result = _process_source(sb, source_key, rows)
-        summary[source_key] = result
-    
-    # 5. 종합 리포트
-    elapsed = round(time.time() - started_at, 2)
-    print(f"\n[run] === Summary (elapsed: {elapsed}s) ===")
-    total_parsed = total_upserted = total_errors = 0
-    for source_key, result in summary.items():
-        print(f"  {source_key}: parsed={result['parsed']}, "
-              f"upserted={result['upserted']}, errors={result['errors']}")
-        total_parsed += result["parsed"]
-        total_upserted += result["upserted"]
-        total_errors += result["errors"]
-    print(f"  TOTAL: parsed={total_parsed}, upserted={total_upserted}, errors={total_errors}")
-    
-    return 0 if total_errors == 0 else 1
+        for k in ("parsed", "upserted", "processed", "errors", "settled"):
+            totals[k] += result[k]
+
+    return totals
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    started_at = time.time()
+    print("[run] ssdm-collector start")
+    print(f"[run] config: BATCH_LIMIT={BATCH_LIMIT} "
+          f"MAX_CYCLES={MAX_CYCLES or 'unlimited'} "
+          f"TIME_BUDGET_SEC={TIME_BUDGET_SEC}")
+
+    sb = _get_supabase()
+
+    SchemaCache.load(sb)
+
+    grand = {
+        "cycles": 0, "fetched": 0, "parsed": 0,
+        "upserted": 0, "processed": 0, "errors": 0,
+    }
+    stop_reason = "unknown"
+    cycle_no = 0
+    prev_id_set: Set[int] = set()
+
+    while True:
+        if MAX_CYCLES and cycle_no >= MAX_CYCLES:
+            stop_reason = f"max cycles reached ({MAX_CYCLES})"
+            break
+
+        elapsed = time.time() - started_at
+        if elapsed >= TIME_BUDGET_SEC:
+            stop_reason = f"time budget exceeded ({int(elapsed)}s / {TIME_BUDGET_SEC}s)"
+            break
+
+        cycle_no += 1
+        cycle_started = time.time()
+        result = _run_cycle(sb, cycle_no)
+
+        if result["fetched"] == 0:
+            stop_reason = "no pending rows left"
+            cycle_no -= 1
+            break
+
+        # 무한루프 방지: 직전 사이클과 동일한 행을 다시 잡았다면
+        # 상태 마킹이 반영되지 않은 것 → 즉시 중단
+        cur_id_set: Set[int] = result["id_set"]
+        if prev_id_set and cur_id_set == prev_id_set:
+            stop_reason = (f"same {len(cur_id_set)} rows fetched again "
+                           f"— status marking not taking effect")
+            cycle_no -= 1
+            break
+        prev_id_set = cur_id_set
+
+        grand["cycles"] = cycle_no
+        for k in ("fetched", "parsed", "upserted", "processed", "errors"):
+            grand[k] += result[k]
+
+        cycle_elapsed = round(time.time() - cycle_started, 2)
+        print(f"[run] cycle {cycle_no} done ({cycle_elapsed}s): "
+              f"fetched={result['fetched']} parsed={result['parsed']} "
+              f"upserted={result['upserted']} processed={result['processed']} "
+              f"errors={result['errors']} settled={result['settled']} "
+              f"| cumulative fetched={grand['fetched']}")
+
+        # 이번 사이클에서 아무 행도 pending을 벗어나지 못했다면 다음 사이클도 동일
+        if result["settled"] == 0:
+            stop_reason = "cycle settled 0 rows (all marking failed)"
+            break
+
+    total_elapsed = round(time.time() - started_at, 2)
+    print(f"\n[run] === Summary (elapsed: {total_elapsed}s) ===")
+    print(f"  stop reason: {stop_reason}")
+    print(f"  cycles:    {grand['cycles']}")
+    print(f"  fetched:   {grand['fetched']}")
+    print(f"  parsed:    {grand['parsed']}")
+    print(f"  upserted:  {grand['upserted']}")
+    print(f"  processed: {grand['processed']}")
+    print(f"  errors:    {grand['errors']}")
+
+    # 비정상 종료 사유는 무조건 실패 처리.
+    # (마킹이 반영되지 않는 상태에서 초록불이 뜨면 장애를 놓친다)
+    if stop_reason.startswith("same ") or stop_reason.startswith("cycle settled 0"):
+        print("[run] ABNORMAL: status marking is not taking effect — check DB/RLS")
+        return 1
+
+    if grand["fetched"] == 0:
+        print("[run] nothing to do")
+        return 0
+
+    return 0 if grand["errors"] == 0 else 1
 
 
 if __name__ == "__main__":
