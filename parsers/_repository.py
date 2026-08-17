@@ -187,6 +187,7 @@ def fetch_pending_raw(
     sb,
     source_key: Optional[str] = None,
     limit: int = 1000,
+    after_id: Optional[int] = None,
 ) -> List[dict]:
     """
     opportunities_raw에서 pending 상태인 raw 데이터 SELECT.
@@ -196,6 +197,17 @@ def fetch_pending_raw(
     fetched_at 정렬은 적체가 커지면 statement timeout을 유발한다
     (부분 인덱스가 없으면 전체 정렬). id는 PK 인덱스를 그대로 타고,
     bigint 자동증가라 적재 순서와 사실상 동일하다.
+
+    after_id (커서):
+        지정하면 id > after_id 인 행만 조회한다.
+        커서가 없으면 사이클이 진행될수록 앞쪽에 쌓인 processed 구간을
+        매번 다시 훑어야 해서 조회 비용이 계속 증가하고 결국 timeout이 난다.
+        직전 사이클의 마지막 id를 넘겨주면 스캔 시작점이 앞으로 밀려
+        사이클 비용이 일정하게 유지된다.
+
+        주의: 커서를 쓰면 커서보다 작은 id 중 이번 실행에서 실패해
+        pending으로 남은 행은 같은 실행 안에서 재조회되지 않는다.
+        다음 실행(커서 초기화)에서 다시 잡히므로 유실은 아니다.
 
     Raises:
         FetchError: 조회 실패 (timeout, 인증 등). 호출부가 반드시 구분해야 함.
@@ -207,6 +219,9 @@ def fetch_pending_raw(
 
         if source_key:
             query = query.eq("source_key", source_key)
+
+        if after_id is not None:
+            query = query.gt("id", after_id)
 
         query = query.order("id", desc=False).limit(limit)
 
