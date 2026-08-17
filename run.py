@@ -33,12 +33,13 @@ import os
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from supabase import create_client
 
 from parsers import PARSER_REGISTRY
 from parsers._repository import (
+    FetchError,
     fetch_pending_raw,
     mark_raw_error_bulk,
     mark_raw_processed,
@@ -157,26 +158,29 @@ def _process_source(sb, source_key: str, raw_rows: List[dict]) -> Dict[str, int]
 
 # ---------------------------------------------------------------- 사이클 1회
 
-def _run_cycle(sb, cycle_no: int) -> Dict[str, object]:
+def _run_cycle(sb, cycle_no: int, after_id: Optional[int]) -> Dict[str, object]:
     """
     사이클 1회 실행.
+
+    after_id는 직전 사이클의 마지막 id (커서).
+    이미 처리한 구간을 다시 스캔하지 않게 해 조회 비용을 일정하게 유지한다.
 
     Returns:
         {
             "fetched": N, "parsed": N, "upserted": N,
             "processed": N, "errors": N, "settled": N,
-            "id_set": set[int],
+            "id_set": set[int], "max_id": int | None,
         }
         fetched == 0 이면 더 처리할 pending 없음.
     """
-    raw_rows = fetch_pending_raw(sb, limit=BATCH_LIMIT)
+    raw_rows = fetch_pending_raw(sb, limit=BATCH_LIMIT, after_id=after_id)
     fetched = len(raw_rows)
 
     if fetched == 0:
         return {
             "fetched": 0, "parsed": 0, "upserted": 0,
             "processed": 0, "errors": 0, "settled": 0,
-            "id_set": set(),
+            "id_set": set(), "max_id": None,
         }
 
     id_set: Set[int] = {r["id"] for r in raw_rows}
@@ -189,6 +193,8 @@ def _run_cycle(sb, cycle_no: int) -> Dict[str, object]:
         "fetched": fetched, "parsed": 0, "upserted": 0,
         "processed": 0, "errors": 0, "settled": 0,
         "id_set": id_set,
+        # id ASC 정렬이므로 마지막 행의 id가 최대값 = 다음 사이클의 커서
+        "max_id": raw_rows[-1]["id"],
     }
 
     for source_key, rows in by_source.items():
@@ -220,6 +226,8 @@ def main():
     stop_reason = "unknown"
     cycle_no = 0
     prev_id_set: Set[int] = set()
+    fetch_failed = False
+    cursor: Optional[int] = None
 
     while True:
         if MAX_CYCLES and cycle_no >= MAX_CYCLES:
@@ -233,7 +241,15 @@ def main():
 
         cycle_no += 1
         cycle_started = time.time()
-        result = _run_cycle(sb, cycle_no)
+        try:
+            result = _run_cycle(sb, cycle_no, cursor)
+        except FetchError as e:
+            # 조회 실패를 '처리할 것 없음'으로 오인하면 안 된다.
+            # 적체가 남은 채 초록불이 뜨는 것이 이번 장애의 핵심 원인이었다.
+            stop_reason = f"fetch failed: {e}"
+            fetch_failed = True
+            cycle_no -= 1
+            break
 
         if result["fetched"] == 0:
             stop_reason = "no pending rows left"
@@ -249,6 +265,7 @@ def main():
             cycle_no -= 1
             break
         prev_id_set = cur_id_set
+        cursor = result["max_id"]
 
         grand["cycles"] = cycle_no
         for k in ("fetched", "parsed", "upserted", "processed", "errors"):
@@ -259,7 +276,7 @@ def main():
               f"fetched={result['fetched']} parsed={result['parsed']} "
               f"upserted={result['upserted']} processed={result['processed']} "
               f"errors={result['errors']} settled={result['settled']} "
-              f"| cumulative fetched={grand['fetched']}")
+              f"| cursor={cursor} cumulative fetched={grand['fetched']}")
 
         # 이번 사이클에서 아무 행도 pending을 벗어나지 못했다면 다음 사이클도 동일
         if result["settled"] == 0:
@@ -277,7 +294,11 @@ def main():
     print(f"  errors:    {grand['errors']}")
 
     # 비정상 종료 사유는 무조건 실패 처리.
-    # (마킹이 반영되지 않는 상태에서 초록불이 뜨면 장애를 놓친다)
+    # (문제가 있는데 초록불이 뜨면 장애를 놓친다)
+    if fetch_failed:
+        print("[run] ABNORMAL: pending 조회 실패 — 인덱스/타임아웃/인증 확인 필요")
+        return 1
+
     if stop_reason.startswith("same ") or stop_reason.startswith("cycle settled 0"):
         print("[run] ABNORMAL: status marking is not taking effect — check DB/RLS")
         return 1
