@@ -34,8 +34,8 @@ def upsert_opportunities(
 
     같은 (source_key, ext_id) 조합이 한 batch 안에 두 번 이상 들어가면
     PostgreSQL 21000 cardinality_violation 에러가 발생하므로, batch 만들기 전에
-    dedupe 처리한다. fetch_pending_raw가 fetched_at ASC 정렬로 가져오므로
-    나중에 온 행(최신)이 승자가 된다.
+    dedupe 처리한다. fetch_pending_raw가 id ASC 정렬로 가져오므로
+    나중에 온 행(= 더 큰 id = 더 나중에 적재된 행)이 승자가 된다.
 
     Returns:
         {
@@ -173,6 +173,16 @@ def mark_raw_error_bulk(sb, raw_ids: List[int], error_message: str) -> int:
         return 0
 
 
+class FetchError(RuntimeError):
+    """
+    pending 조회 자체가 실패했음을 나타낸다.
+
+    빈 리스트로 반환하면 호출부가 '처리할 것이 없다'로 오인해
+    정상 종료(exit 0)해버린다. 실제로는 수십만 건이 남아 있는데
+    워크플로우는 초록불이 되므로 장애를 놓친다.
+    """
+
+
 def fetch_pending_raw(
     sb,
     source_key: Optional[str] = None,
@@ -181,6 +191,14 @@ def fetch_pending_raw(
     """
     opportunities_raw에서 pending 상태인 raw 데이터 SELECT.
     source_key 지정 시 해당 source만 처리.
+
+    정렬은 id ASC.
+    fetched_at 정렬은 적체가 커지면 statement timeout을 유발한다
+    (부분 인덱스가 없으면 전체 정렬). id는 PK 인덱스를 그대로 타고,
+    bigint 자동증가라 적재 순서와 사실상 동일하다.
+
+    Raises:
+        FetchError: 조회 실패 (timeout, 인증 등). 호출부가 반드시 구분해야 함.
     """
     try:
         query = sb.table("opportunities_raw").select(
@@ -190,10 +208,10 @@ def fetch_pending_raw(
         if source_key:
             query = query.eq("source_key", source_key)
 
-        query = query.order("fetched_at", desc=False).limit(limit)
+        query = query.order("id", desc=False).limit(limit)
 
         res = query.execute()
         return res.data or []
     except Exception as e:
         print(f"[Repository] fetch_pending failed: {e}")
-        return []
+        raise FetchError(f"{type(e).__name__}: {e}") from e
