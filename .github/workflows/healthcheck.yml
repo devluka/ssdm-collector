@@ -1,0 +1,119 @@
+name: Healthcheck — Pipeline Self Check
+
+# 목적
+# 1. 파이프라인이 조용히 죽는 것을 감지 (컬렉터 중단, 적체, 파서 깨짐)
+# 2. 리포트를 커밋해 리포지토리 활동을 남김
+#    → GitHub의 "스케줄 워크플로우 60일 무활동 자동 비활성화"를 예방
+# 3. 치명적 이상은 Issue로 승격
+
+on:
+  schedule:
+    # 매월 1일 KST 09:00 (UTC 00:00)
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+# 리포트 커밋과 Issue 생성에 필요
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: healthcheck
+  cancel-in-progress: false
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run healthcheck
+        id: hc
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          HC_STALE_DAYS: '3'
+          HC_PENDING_WARN: '50000'
+          HC_ERROR_WARN: '1000'
+          HC_ERROR_WINDOW_DAYS: '7'
+          HC_RAW_SIZE_WARN_MB: '500'
+        run: python scripts/healthcheck.py
+
+      - name: Commit report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Issue 본문 임시파일은 커밋에서 제외
+          rm -f checks/_issue_body.md
+
+          git add checks/
+          if git diff --staged --quiet; then
+            echo "변경 없음 — 빈 커밋으로 활동 기록"
+            git commit --allow-empty -m "chore(healthcheck): ${{ steps.hc.outputs.status }} $(date -u +%Y-%m-%d)"
+          else
+            git commit -m "chore(healthcheck): ${{ steps.hc.outputs.status }} $(date -u +%Y-%m-%d)"
+          fi
+          git push
+
+      - name: Create issue on failure
+        if: steps.hc.outputs.status == 'FAIL'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const title = process.env.ISSUE_TITLE;
+            const bodyFile = process.env.ISSUE_BODY_FILE;
+
+            let body = '자동 점검에서 이상이 감지되었습니다. 상세 내용을 확인하지 못했습니다.';
+            if (bodyFile && fs.existsSync(bodyFile)) {
+              body = fs.readFileSync(bodyFile, 'utf8');
+            }
+
+            // 같은 제목의 열린 이슈가 있으면 코멘트만 추가 (중복 생성 방지)
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'healthcheck',
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: body,
+              });
+              core.info(`기존 이슈 #${existing.data[0].number}에 코멘트 추가`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['healthcheck'],
+              });
+              core.info(`이슈 #${created.data.number} 생성`);
+            }
+        env:
+          ISSUE_TITLE: ${{ steps.hc.outputs.issue_title }}
+          ISSUE_BODY_FILE: ${{ steps.hc.outputs.issue_body_file }}
+
+      - name: Summary
+        run: |
+          echo "### Healthcheck: ${{ steps.hc.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "${{ steps.hc.outputs.report_path }}" ]; then
+            cat "${{ steps.hc.outputs.report_path }}" >> $GITHUB_STEP_SUMMARY
+          fi
